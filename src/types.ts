@@ -5,7 +5,7 @@ export type AutomationId =
   | 'france-travail-recherche' 
   | 'pipeline-croise';
 
-export type OutputMode = 'playwright' | 'console' | 'curl' | 'python';
+export type OutputMode = 'playwright' | 'console' | 'curl' | 'python' | 'prompt';
 
 export interface AutomationParameter {
   id: string;

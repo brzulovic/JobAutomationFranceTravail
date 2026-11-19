@@ -1,20 +1,19 @@
-FROM node:20-alpine AS builder
+FROM oven/bun:alpine AS builder
 WORKDIR /app
-COPY package*.json ./
-RUN npm install
+COPY package.json ./
+RUN bun install
 COPY . .
-RUN npm run build
+RUN bun run build
 
-FROM node:20-alpine AS runner
+FROM oven/bun:alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 
-COPY package*.json ./
-RUN npm ci --only=production
+COPY package.json ./
+RUN bun install --production
 
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.ts ./server.ts
-COPY --from=builder /app/package.json ./package.json
 
 EXPOSE 3000
-CMD ["npm", "run", "start"]
+CMD ["bun", "run", "server.ts"]
