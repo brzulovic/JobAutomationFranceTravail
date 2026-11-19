@@ -42,23 +42,19 @@ export const AUTOMATIONS: AutomationDefinition[] = [
     ],
     pitfalls: [
       {
+        problem: 'Session expiry / redirect to login page',
+        solution: 'Always execute ensureLoggedIn() first using saved profile or session cookies.'
+      },
+      {
         problem: 'Indeed/LinkedIn obfuscated CSS classes',
         solution: 'Parser uses stable selectors (`a[href*="/viewjob?jk="]`, `a[href*="/jobs/view"]`) and `innerText` analysis.'
-      },
-      {
-        problem: 'LinkedIn virtualized list (count mismatch)',
-        solution: 'Script scrolls down container repeatedly until all applied cards are loaded in DOM.'
-      },
-      {
-        problem: 'LinkedIn relative dates (e.g. 3w ago)',
-        solution: 'Converted to approximate calendar date based on export date.'
       }
     ],
     steps: [
+      '1. Authenticate & ensure session cookie (ensureLoggedIn).',
       'Navigate to Indeed Applied and LinkedIn Job Tracker pages.',
       'Verify header counters (e.g. "Candidatures envoyées N" / "Applied · N").',
       'Extract list items via page evaluation (CDP / DOM parsing).',
-      'Deduplicate LinkedIn cards by job ID (`/jobs/view/{id}`).',
       'Generate combined Markdown report with statistics breakdown.'
     ]
   },
@@ -102,23 +98,19 @@ export const AUTOMATIONS: AutomationDefinition[] = [
     ],
     pitfalls: [
       {
+        problem: 'Google account sign-in wall',
+        solution: 'Execute ensureLoggedIn() with persistent profile storage or OAuth cookie injection.'
+      },
+      {
         problem: 'Clicking email rows marks them as read',
         solution: 'Read-only DOM parsing via row selectors (`tr.zA`) without clicking individual messages.'
-      },
-      {
-        problem: 'DOM rendering residuals from previous search',
-        solution: 'Filter rows using `offsetParent !== null || getClientRects().length > 0`.'
-      },
-      {
-        problem: 'Gmail OR query syntax',
-        solution: 'Use quoted phrases with `OR` (never use curly braces `{a|b}` or pipe `|`).'
       }
     ],
     steps: [
+      '1. Authenticate & ensure Gmail session (ensureLoggedIn).',
       'Open Gmail to the target search URL.',
       'Verify input query in search bar and ensure search results rendered.',
       'Extract rows (`tr.zA`) with sender (`.yW`), subject (`.y6`), date (`.xW.xY`).',
-      'Classify emails into Responses, Alerts, and Noise.',
       'Export structured Markdown report.'
     ]
   },
@@ -150,23 +142,19 @@ export const AUTOMATIONS: AutomationDefinition[] = [
     ],
     pitfalls: [
       {
-        problem: 'Button ref changes after each click',
+        problem: 'France Travail session timeout',
+        solution: 'Run ensureLoggedIn() before loading timeline.'
+      },
+      {
+        problem: 'Ref changes after each click',
         solution: 'Re-query button via grep/selector for "Afficher plus" before every click.'
-      },
-      {
-        problem: 'Snapshot/Read truncation on long timelines',
-        solution: 'Use `evaluate` script with large `maxChars` rather than snapshot.'
-      },
-      {
-        problem: 'Irrelevant h2 month headers in intensity graph',
-        solution: 'Filter out headers matching `/^\\d+ \\w+ 2026$/`.'
       }
     ],
     steps: [
+      '1. Authenticate & verify France Travail login (ensureLoggedIn).',
       'Navigate to France Travail Journal page.',
       'Loop clicking "Afficher plus" until button disappears.',
       'Extract structured DOM tree (h2 dates, h3 titles, strong statuses).',
-      'Compute quick statistics (job application replies vs web searches vs other).',
       'Export dated Markdown journal report.'
     ]
   },
@@ -230,24 +218,20 @@ export const AUTOMATIONS: AutomationDefinition[] = [
     ],
     pitfalls: [
       {
+        problem: 'Redirect to login when adding démarche',
+        solution: 'Execute ensureLoggedIn() first before filling form.'
+      },
+      {
         problem: 'Wrong category section',
         solution: 'Must expand "Préparer sa candidature" category first before clicking sub-items.'
-      },
-      {
-        problem: 'Lazy loaded sub-elements',
-        solution: 'Resnapshot / wait after expanding accordion categories.'
-      },
-      {
-        problem: 'Checkbox state change not registering in diff',
-        solution: 'Refetch snapshot after clicking "Démarche réalisée" checkbox.'
       }
     ],
     steps: [
+      '1. Authenticate & verify login session (ensureLoggedIn).',
       'Open France Travail add démarche page.',
       'Expand "Préparer sa candidature" accordion category.',
-      'Click appropriate sub-item based on type (repondre or rechercher > Sur internet).',
-      'Fill dialog fields (Company/Site, Job Title, Comment, Date).',
-      'Check "Démarche réalisée" if applicable and click "Ajouter aux démarches".'
+      'Click appropriate sub-item and fill form fields.',
+      'Submit and verify confirmation message.'
     ]
   },
   {
@@ -278,23 +262,19 @@ export const AUTOMATIONS: AutomationDefinition[] = [
     ],
     pitfalls: [
       {
-        problem: 'Company name variations (e.g. FDJ UNITED vs FDJ)',
-        solution: 'Normalizes company names (lowercase, no accents, remove suffixes like SA/SAS/Group) and uses fuzzy containment.'
+        problem: 'Missing exported source files',
+        solution: 'Execute login & scraper steps first if --fresh is enabled.'
       },
       {
-        problem: 'Confusing job search démarches with job applications',
-        solution: 'Only match FT entries starting with "Réponse à l\'offre de".'
-      },
-      {
-        problem: 'Date discrepancy due to declaration delay',
-        solution: 'Accept date delta <= 7 days as OK; delta > 7 days flagged as ⚠️ Review.'
+        problem: 'Company name variations',
+        solution: 'Normalizes company names before fuzzy matching.'
       }
     ],
     steps: [
+      '1. Verify session authentication across platforms if --fresh is set.',
       'Load latest Indeed/LinkedIn sent applications and France Travail journal markdown files.',
       'Extract normalized company names and application dates.',
       'Fuzzy match each sent application against FT "Réponse à l\'offre" entries.',
-      'Classify each entry into Up-to-date, Missing, or Review.',
       'Export consolidated pipeline status markdown report.'
     ]
   }
