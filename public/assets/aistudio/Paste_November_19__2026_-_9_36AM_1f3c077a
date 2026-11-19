@@ -1,0 +1,578 @@
+---
+name: candidatures-envoyees
+description: "Use when the user asks to retrieve / dump the list of applications they already sent on Indeed and/or LinkedIn — e.g. 'mes candidatures envoyées sur Indeed', 'liste des jobs applied LinkedIn', 'exporte mes candidatures Indeed + LinkedIn', 'myjobs.indeed.com/applied', 'linkedin.com/jobs-tracker'. Extracts job title, company, location, date, status, link per application on both sites, and exports a combined Markdown file."
+allowed-tools: ["Inspect", "Bash", "browseros_tabs", "browseros_navigate", "browseros_act", "browseros_grep", "browseros_evaluate", "browseros_read"]
+---
+
+# Récupérer les candidatures envoyées (Indeed + LinkedIn)
+
+## Overview
+
+Via le MCP BrowserOS, extrait les candidatures **déjà envoyées** par
+l'utilisateur sur :
+
+- **Indeed** : `https://myjobs.indeed.com/applied` (« Mes emplois »)
+- **LinkedIn** : `https://www.linkedin.com/jobs-tracker/?stage=applied` (Job tracker, onglet Applied)
+
+Pour chaque candidature : titre du poste, entreprise, lieu, date, statut
+(Indeed) / statuts additionnels (LinkedIn, ex. « Application viewed »), id +
+lien de l'offre. Affiche la liste et l'exporte en Markdown combiné.
+
+## Entrées
+
+- Aucun paramètre obligatoire. Options naturelles :
+  - `indeed` seul / `linkedin` seul → limiter à un site ;
+  - chemin de fichier ou dossier explicite → dossier d'export ;
+  - `--no-export` → liste à l'écran seulement.
+
+## Étapes
+
+1. **Préparer BrowserOS**
+   - Vérifier qu'il tourne : `ps -C browseros`. Sinon le lancer en arrière-plan.
+   - `tabs` `action: "list"` (premier appel de la connexion). Ne **jamais** fermer un onglet existant.
+   - Pour chaque site cible : si un onglet *propre à l'agent* y est déjà → le réutiliser ; sinon ouvrir son propre onglet jumeau `tabs` `action: "new"` sur l'URL, `background: false` (ne pas voler l'onglet de l'utilisateur s'il en a un).
+   - Connexion : les deux sites sont normalement déjà connectés dans le profil BrowserOS. Si un login apparaît sur Indeed ou LinkedIn, demander à l'utilisateur de se connecter dans BrowserOS puis reprendre.
+
+2. **Site Indeed — extraire (une seule passe suffit)**
+   - Page : `https://myjobs.indeed.com/applied`. Les sections « 14 derniers jours » / « Plus ancien » sont toutes dans le DOM (pas de bouton « afficher plus »).
+   - Récupérer le compteur d'en-tête (« Candidatures envoyées N ») pour vérifier l'exhaustivité.
+   - Extraction via `evaluate` (CDP, `maxChars: 200000`) :
+
+     ```js
+     return (function () {
+       const rows = Array.from(document.querySelectorAll("li"))
+         .filter(li => li.querySelector('a[href*="/viewjob?jk="]'));
+       const items = rows.map(li => {
+         const lines = (li.innerText || "").split("\n").map(s => s.trim()).filter(Boolean);
+         const a = li.querySelector('a[href*="/viewjob?jk="]');
+         const jk = (a.getAttribute("href").match(/jk=([a-z0-9]+)/) || [])[1];
+         // lignes typiques : [statut, titre, "La description de poste...", entreprise, lieu, "Candidature envoyée sur Indeed X", ...]
+         const descrIdx = lines.findIndex(l => /description de poste/i.test(l));
+         const statut = lines[0] || "";
+         const titre = lines[1] || "";
+         const after = lines.filter((l, i) => i > descrIdx);
+         const entreprise = after[0] || "";
+         const lieu = after[1] || "";
+         const dateTxt = lines.find(l => /^Candidature (envoie|consult)/i.test(l)) || "";
+         const lien = a.getAttribute("href").split("&")[0]; // retirer hl=fr
+         return { statut, titre, entreprise, lieu, dateTxt, jk, lien };
+       });
+       return JSON.stringify({ items });
+     })()
+     ```
+
+   - Contrat : `items.length` == compteur d'en-tête « Candidatures envoyées » ; chaque item a un `jk`.
+   - Statuts possibles : « Candidature envoyée », « Non retenue par l'employeur », « Candidature consultée », « Offre d'emploi fermée ou expirée sur Indeed » (peut précéder `lines[0]` selon l'ordre des lignes).
+   - Référence : le `data` viewjob `jk` est l'identifiant fiable de l'offre.
+   - Dates Indeed en texte FR (« 29 oct. », « 4 sept. ») → utiliser tel quel + année courante pour la date approximative.
+
+3. **Site LinkedIn — extraire**
+   - Page : `https://www.linkedin.com/jobs-tracker/?stage=applied`. Attendre ~3-4 s (SPA) puis vérifier le compteur de l'onglet « Applied · N ».
+   - Si `count < N` : la liste peut être virtualisée → scroller la liste et re-extraire jusqu'à ce que le nombre de cartes == N.
+   - Extraction via `evaluate` (`maxChars: 40000`) : chaque carte est un **lien global** `a[href*="/jobs/view"]` contenant le texte de la carte (les classes CSS sont obfusquées `fa4xxxx` : NE PAS se fier aux classes) :
+
+     ```js
+     return (function () {
+       const anchors = Array.from(document.querySelectorAll('a[href*="/jobs/view"]'))
+         .filter(a => a.innerText.includes("\n")); // textes complets multi-lignes uniquement
+       const seen = new Set();
+       const items = [];
+       for (const a of anchors) {
+         const href = a.getAttribute("href");
+         const id = (href.match(/\/jobs\/view\/(\d+)/) || [])[1];
+         if (seen.has(id)) continue; // cartes imbriquées → doublons par id
+         seen.add(id);
+         const block = (a.parentElement ? a.parentElement.innerText : a.innerText);
+         const lines = a.innerText.split("\n").map(s => s.trim()).filter(Boolean);
+         const applied = (block.match(/Applied +([0-9]+\s?[a-z]+ ago|today)/i) || [])[1] || "";
+         const title = (lines[0] || "").replace(/ \(Verified job\)$/, "");
+         const compLine = lines.find(l => l.includes("·")) || "";
+         const entreprise = compLine.split("·")[0].trim();
+         const lieu = compLine.split("·")[1] ? compLine.split("·")[1].trim() : "";
+         const meta = lines.find(l => /^\(.*\)$/.test(l)) || "";
+         const extras = block.split("\n").map(s => s.trim()).filter(Boolean)
+           .filter(l => /^(Resume downloaded|Application viewed|Referred|\+\d+|Yes|No)$/i.test(l));
+         items.push({ id, titre: title, entreprise, lieu, applied, meta, extras,
+                      lien: "https://www.linkedin.com/jobs/view/" + id + "/" });
+       }
+       return JSON.stringify({ count: items.length, items });
+     })()
+     ```
+
+   - Champ `extras` pioche dans le texte du **parent** de l'ancre pour attraper les statuts hors lien : « Resume downloaded », « Application viewed », « +N » (nombre de notes), « Yes/No ».
+   - Dates LinkedIn **relatives** (« 3w ago », « 1mo ago ») : convertir en date approximative = date d'export − (n×7 / n×30 jours) et conserver aussi le texte relatif.
+
+4. **Restituer**
+   - Table/liste groupée par site, champs : titre, entreprise, lieu, date (approx.), statut, id, lien.
+   - Rappeler les compteurs vérifiés (Indeed « Candidatures envoyées », LinkedIn « Applied · »).
+
+5. **Export du résultat**
+   - **Par défaut, exporter systématiquement** — sauf indication contraire de l'utilisateur.
+   - Fichier : `candidatures-<JJ-MM-AAAA>.md` (date d'export), dossier demandé par l'utilisateur sinon dossier de travail courant (p. ex. `~/Documents/CV`). Écrire avec l'outil fichier, jamais via le navigateur.
+   - Structure du fichier :
+     - Titre `# Candidatures envoyées — Indeed + LinkedIn`
+     - Bloc citation : date d'export, compteurs vérifiés (Indeed N / LinkedIn N), légende des statuts.
+     - `## Indeed (N)` → une table/entrée par candidature (titre, entreprise, lieu, date, statut, lien).
+     - `## LinkedIn (N)` → idem avec date relative + date approx. calculée + statuts additionnels + notes.
+     - `## Statistiques rapides` : total combiné, répartition par statut (Indeed : envoyée / non retenue / consultée / fermée ; LinkedIn : extra « Application viewed », « Resume downloaded », etc.), période couverte.
+   - Signaler le chemin complet exact de l'export dans la réponse.
+   - Si `--no-export`, sauter cette étape.
+
+## Contrat de succès
+
+- Compteurs vérifiés : `éléments extraits == compteurs affichés` sur chaque site (Indeed « Candidatures envoyées », LinkedIn onglet « Applied · »).
+- Chaque entrée avec titre + entreprise (+ lieu et date quand disponibles).
+- Fichier Markdown combiné créé au chemin annoncé (sauf `--no-export`).
+- Aucun onglet BrowserOS existant n'a été fermé ; pages non modifiées (lecture seule).
+
+## Pièges
+
+| Problème | Solution |
+|----------|----------|
+| Classes CSS Indeed/LinkedIn | Classes obfusquées/variables → parser par sélecteurs stables (`a[href*="/viewjob?jk="]`, `a[href*="/jobs/view"]`) + `innerText` |
+| Cartes LinkedIn en double (8 cartes → 16 ancres) | Dédupliquer par id d'offre `/jobs/view/{id}` |
+| Statuts LinkedIn hors du lien-carte (« Resume downloaded », « Application viewed », « +N », « Yes/No ») | Parser le `parentElement` de l'ancre en plus de l'ancre |
+| Dates LinkedIn relatives uniquement | Convertir en date approximative depuis la date d'export, garder le texte relatif |
+| Liste LinkedIn virtualisée (count < compteur « Applied · ») | Scroller la liste puis re-extraire jusqu'à atteindre le compteur |
+| Lignes Indeed parasites | Ignorer la ligne « La description de poste s'ouvre dans une nouvelle fenêtre » |
+| Statut « Offre fermée ou expirée » Indeed (ordre de lignes) | Le lire comme statut du bloc si présent avant `lines[0]` |
+| Titre LinkedIn « (Verified job) » collé au titre | Retirer le suffixe du titre affiché |
+| Session expirée (login Indeed/LinkedIn) | Demander à l'utilisateur de se connecter dans BrowserOS, reprendre à l'étape 1 |
+| Date exacte exigée (pas d'approx.) | Ouvrir le détail de la candidature (1 clic par offre) pour récupérer la date complète |
+---
+name: candidatures-gmail
+description: "Use when the user asks to retrieve / dump the job application emails from their Gmail via BrowserOS — e.g. 'récupère mes candidatures gmail', 'liste des réponses recruteurs', 'emails candidatures Gmail', 'mes messages suivis / starred'. Runs a Gmail search (default: is:starred, the user files application replies in STARRED mails, NOT in a label), parses the results list (sender, subject, date), classifies recruiter responses vs alerts vs noise, and exports a Markdown file."
+allowed-tools: ["Inspect", "Bash", "browseros_tabs", "browseros_navigate", "browseros_snapshot", "browseros_act", "browseros_grep", "browseros_evaluate", "browseros_read"]
+---
+
+# Récupérer les candidatures par Gmail
+
+## Overview
+
+Via le MCP BrowserOS, lance une recherche Gmail et retourne la liste
+structurée des mails (expéditeur, objet, date) classifiés, + export Markdown.
+
+⚠ **Comportement de l'utilisateur** : les candidatures/réponses recruteurs
+sont marquées d'une **étoile** (« Messages suivis »), `is:starred` — PAS
+taggées avec un label. Un label `candidatures` existe dans la boîte mais il est
+générique (des milliers de conv., chargé de newsletters/alertes) : ne l'utiliser
+que sur demande explicite.
+
+## Entrées
+
+- `$1` — mode de recherche (optionnel) :
+  - `starred` (défaut) → `is:starred` (source "Messages suivis") ;
+  - `recruteur` → affiner en étoiles : `is:starred (Objet:"Votre candidature" OR Objet:"Retour candidature" OR Objet:"Bien reçu" OR Objet:"candidature est arrivée" OR Objet:"Des nouvelles de votre candidature" OR Objet:"Merci de votre candidature" OR Objet:"Merci d'avoir postulé" OR Objet:"Thank you for your application" OR Objet:"application was sent")` ;
+  - `label` → `label:candidatures` (⚠ générique, ~5 694 conv. chargées de bruit) ;
+  - une **requête Gmail brute** transmise telle quelle (syntaxe : `"..." OR "..."` — pas de `{a|b}` ni de gestes `|`) ;
+  - `--no-export` → liste à l'écran seulement.
+
+## Étapes
+
+1. **Préparer BrowserOS**
+   - Vérifier qu'il tourne : `ps -C browseros`. Sinon le lancer en arrière-plan.
+   - `tabs` `action: "list"` (premier appel de la connexion). Ne **jamais** fermer un onglet existant.
+   - Onglet agent : sinon `tabs` `action: "new"`, `url: "https://mail.google.com/mail/u/0/#starred"`, `background: false`.
+   - Contrat de connexion : titre = « <email> - Gmail » (ici brzulovic@gmail.com). Sinon demander à l'utilisateur de se connecter dans BrowserOS puis reprendre.
+
+2. **Lancer la recherche**
+   - `navigate` `action: "url"` → `https://mail.google.com/mail/u/0/#search/` + `encodeURIComponent($1)`.
+   - `wait` ~3 s. **Vérifier le chargement** (contrat) :
+     - `input[name='q']` == la requête (attention : le hash des quotes peut arriver dans la barre SANS que la recherche soit lancée).
+     - Au moins une ligne `tr.zA` **visible** + compteur du type `1–N sur M` (M peut être un grand chiffre).
+     - Si la barre contient la requête mais 0 ligne et pas de compteur → snapshot, repérer les refs du `button "Rechercher dans les messages"` puis `act` `kind: "click"` sur ce bouton.
+   - Syntactique : la syntaxe OR Gmail = phrases quotées + `OR` (pas de `|` ; `{a|b}` renvoie 0 résultat de façon silencieuse).
+
+3. **Parser la liste (⚠ lecture seule — ne jamais cliquer une ligne : un clic passe le mail en « lu »)**
+   - Filtre de visibilité OBLIGATOIRE : Gmail garde en DOM des `tr.zA` **résidus du rendu précédent** (ex. « Messages suivis » après navigation vers une recherche) — écartés via `offsetParent !== null || r.getClientRects().length > 0`.
+   - Règle : page = fenêtre glissante d'≈100 lignes visibles ; le compteur total « sur M » limite le périmètre.
+   - Extraction via `evaluate` (CDP, `maxChars: 250000`) :
+
+     ```js
+     return (function () {
+       const rows = Array.from(document.querySelectorAll("tr.zA"))
+         .filter(r => r.offsetParent !== null || r.getClientRects().length > 0);
+       const items = rows
+         .filter(r => !/Ce message a été classé/.test(r.innerText.split("\n")[0]))
+         .map(r => ({
+           expediteur: ((r.querySelector(".yW") || {}).innerText || "").replace(/\s*\n\s*/g, " ").trim(),
+           objet: ((r.querySelector(".y6") || {}).innerText || "").trim(),
+           date: ((r.querySelector(".xW.xY") || {}).innerText || "").trim(),
+           labels: [...new Set(Array.from(r.querySelectorAll(".yi div")).map(d => d.innerText.trim()).filter(Boolean))],
+           threadId: r.getAttribute("data-legacy-thread-id") || ""
+         }));
+       const m = (document.body.innerText.match(/\d+\s*[–-]\s*\d+\s+sur\s+([\d\u202f,\s]+)/) || [])[1];
+       return JSON.stringify({ count: items.length, totalSur: m ? m.replace(/[\s\u202f]/g, "") : null, items });
+     })()
+     ```
+
+   - Contrat de base : `items.length` ≈ 100 max par page ; `totalSur` présent ; dates cohérentes (hier → « 26 oct. »…).
+   - **Fenêtre glissante (pagination)** : scroller le conteneur scrollable (ex. `div.at9`, `scrollTop = scrollHeight`) ne fait PAS ajouter 100 lignes : le lot le plus ancien sort par le haut. Donc pour couvrir plus que la 1re page → **extraction incrémentale** : extraite page → scroll → re-extraction → dédupliquer par (expéditeur+objet+date) en gardant les nouvelles lignes uniquement. Sinon limiter le skill à la 1re page (100 plus récents mails ; suffisant en général).
+
+4. **Classifier (important pour `starred` qui mélange la vie perso)**
+   - **Réponses candidature / envois** : objet contenant « candidature », « Votre candidature », « postulé », « Thank you for your application », « application was sent », « Des nouvelles de … », nom d'entreprise — expéditeurs types : Hellowork Candidatu., LinkedIn « application was sent to … », Yasmina/Haddouche (recrutement), Devoteam, Harvest, AXA @ icims, DO IT NOW…
+   - **Alertes offres** (utile mais pas une réponse) : « Indeed », « LinkedIn Job Alerts », « France Travail vous propose », « Hellowork ».
+   - **Bruits / hors sujet** : banques, santé, courses/webinaires, « Feuille de route », moi → … Les lister en catégorie à part, pas dans les candidatures.
+   - Dates du jour affichées en heures (« 16:43 ») → date = jour J.
+
+5. **Restituer**
+   - Table / liste groupée par catégorie (réponses → alertes → bruit), triée du plus récent.
+   - Champs : date (inférée : jour J si heure seule, sinon année courante/année -1 si futur) · expéditeur · objet · labels éventuels.
+   - Compteur : pages chargées / total Gmail « sur M ».
+
+6. **Export du résultat**
+   - **Par défaut, exporter** — sauf `--no-export`.
+   - Fichier : `candidatures-gmail-<JJ-MM-AAAA>.md` (date d'export), dossier demandé par l'utilisateur sinon dossier de travail courant (p. ex. `~/Documents/CV`).
+   - Écrire le fichier avec l'outil fichier (write), jamais via le navigateur.
+   - Structure du fichier :
+     - Titre `# Candidatures par Gmail — <requête>`
+     - Bloc citation : date d'export, requête exacte, total Gmail (« sur M »), pages chargées, méthode (lecture seule).
+     - `## Réponses candidature / envois (N)` → table date | expéditeur | objet.
+     - `## Alertes offres (N)` → même table, matériaux condensés.
+     - `## Hors candidatures (bruit) (N)` → simple liste.
+     - `## Statistiques rapides` : total chargé, répartition des trois catégories (réponses / alertes / bruit), plus ancienne date chargée, rappel « exhaustivité limitée au périmètre de la requête ».
+   - Signaler le chemin exact de l'export.
+
+## Contrat de succès
+
+- Requête lancée et vérifiée (ligne + compteur « sur M », ou clic sur le bouton de recherche).
+- N lignes `tr.zA` VISIBLES parsées (pas les résidus du DOM), champs non vides.
+- Classification en 3 catégories (réponses / alertes / bruit) avec sous-totaux cohérents.
+- Fichier Markdown créé au chemin annoncé (sauf `--no-export`).
+- Aucun onglet BrowserOS fermé ; aucun mail marqué lu/ouvert (lecture seule).
+
+## Pièges
+
+| Problème | Solution |
+|----------|----------|
+| Résidus du rendu précédent dans le DOM (130 lignes pour une page de 100) | Filtrer `offsetParent !== null || getClientRects().length > 0` |
+| Labels groupes répétés x4 dans la même ligne | Dédupliquer par Set |
+| Valeurs « sur 5 694 » avec espace fine U+202F | Regex `[\d\u202f,\s]+` + `.replace(/[\s\u202f]/g,"")` |
+| La barre contient la requête mais rien ne se lance (0 ligne ET pas de compteur) | Snapshot → bouton `Rechercher dans les messages` → clic |
+| Syntaxe OR Gmail | `"Phrase A" OR "Phrase B"` — pas de `{a|b}`, pas de `|` (0 résultat silencieux) |
+| Le scroll est une fenêtre glissante de ~100 (le haut sort du DOM) | Extraction incrémentale page → scroll → extraction → dédoublonnage |
+| Bannière « Ce message a été classé dans les messages importants » | Filtrer le 1er split du innerText |
+| Date affichée en heure (« 16:43 ») pour les mails du jour | Traduire = jour courant |
+| « sur 5 694 » pour label:candidatures | Label générique/chiffre énorme : préférer `is:starred` (c'est le comportement réel de l'utilisateur) |
+| innerText infidèle (objet/extrait dupliqués dans le row brut) | `.y6` = objet · `.yW` = expéditeur · `.yP/.y2` = extrait — jamais du innerText brut du row |
+| Mail « suivant » (étoile) non lu dans la liste | Ne **jamais** cliquer une ligne — lecture par la liste uniquement |
+| Compte différent (u/0, u/1…) | Détecter le compte via le titre d'onglet « <email> - Gmail » |
+| Sélecteur `.yW/.y6` cassé par mise à jour Gmail | Retomber sur `tr.zA` innerText parsé ligne à ligne (les classes zA sont historiquement très stables) |
+---
+name: france-travail-liste
+description: "Use when the user asks to dump / recover the complete list of démarches from their France Travail 'Journal des démarches' (Organisation des démarches) on candidat.francetravail.fr — e.g. 'liste de toutes les démarches', 'récupère mon journal', 'exporte mes démarches', 'where do I see all my démarches'. Loads the full timeline by repeatedly clicking 'Afficher plus', extracts it as a structured list, then exports it as a Markdown file."
+allowed-tools: ["Inspect", "Bash", "browseros_tabs", "browseros_navigate", "browseros_snapshot", "browseros_grep", "browseros_act", "browseros_evaluate"]
+---
+
+# Lister toutes les démarches du Journal France Travail
+
+## Overview
+
+Récupère la liste **complète** des démarches du journal
+(`https://candidat.francetravail.fr/demarcheretouremploi/journal`) via le MCP
+BrowserOS : charge tout en cliquant répétitivement sur « Afficher plus », puis
+extrait `dates (h2)` + `entrées (h3)` + statut (strong) directement du DOM,
+affiche une liste groupée par date **et exporte le résultat dans un fichier
+Markdown** (`journal-demarches-<JJ-MM-AAAA>.md`).
+
+## Étapes
+
+1. **Préparer BrowserOS**
+   - Vérifier qu'il tourne : `ps -C browseros`. Sinon le lancer en arrière-plan.
+   - `tabs` `action: "list"` (premier appel de la connexion). Ne **jamais** fermer un onglet existant.
+   - Réutiliser un onglet déjà sur `/demarcheretouremploi/journal` (sien/propre) ; sinon `tabs` `action: "new"` sur cette URL, `background: false`.
+
+2. **Page journal propre**
+   - `navigate` `action: "reload"` sur la page (purge un dialogue détail éventuellement resté ouvert).
+   - Confirmer `h1 "Organisation des démarches"`. Popup cookies → fermer.
+   - Non connecté → demander à l'utilisateur de se connecter dans BrowserOS, puis reprendre.
+
+3. **Charger TOUT le journal — boucle « Afficher plus »**
+   - Le journal pagine : un bouton `button "Afficher plus" [ref=eN]` se trouve en fin de timeline.
+   - Cliquer en boucle (`act` `kind: "click"`, `diff: "none"` pour éviter le bruit) **jusqu'à disparition** du bouton :
+     - Le ref peut changer en cours de route (`e31` → `e118`) : à chaque itération, retrouver le ref via `grep` `pattern: "Afficher plus"` (`button "Afficher plus" \[ref=(e\d+)\]`), puis cliquer.
+     - Critère d'arrêt : le grep ne trouve plus le bouton. Après disparition apparaissent « Afficher moins » et « Afficher les 15 jours précédents/suivants » (navigation de fenêtre, ne pas cliquer).
+   - En pratique : ~46 clics pour un journal complet (paginé en 47 pages). Procéder par lots (p. ex. 10 clics par appel d'outil) pour rester fluide.
+
+4. **Extraire via evaluate (⚠ ne PAS utiliser snapshot/read)**
+   - `snapshot` est tronqué (~20 Ko) et `read` tronqué/élidé sur un journal complet : passer par `evaluate` (JS dans la page, CDP) avec `maxChars: 200000`.
+   - Code d'extraction (ordre DOM) :
+     ```js
+     return (function () {
+       const data = [];
+       let cur = null;
+       for (const el of Array.from(document.querySelectorAll("main h2, main h3"))) {
+         const txt = el.textContent.trim();
+         if (el.tagName === "H2") {
+           if (/^\d+ \w+ 2026$/.test(txt)) continue; // en-têtes "mois" de la section Intensité — ignorer
+           cur = { date: txt.replace(/Aujourd'?hui.*$/i, "(aujourd'hui)"), items: [] };
+           data.push(cur);
+         } else if (cur) {
+           const li = el.closest("li");
+           const st = li && li.querySelector("strong");
+           cur.items.push({ t: txt, s: (st && st.textContent.trim()) || "" });
+         }
+       }
+       return JSON.stringify({
+         total: data.reduce((n, g) => n + g.items.length, 0),
+         groups: data,
+       });
+     })()
+     ```
+   - Contrat : `total` ≈ 40–60, dernière date = date la plus ancienne du compte (création), aujourd'hui en tête.
+
+5. **Restituer**
+   - Afficher une **liste**, groupée par date décroissante (la chronologie garantit déjà l'ordre), chaque entrée `Titre` + statut (`Faite` ✔ / statut absent ⚠).
+   - Signaler les entrées **sans statut** (souvent des démarches planifiées ou un artefact d'affichage).
+
+6. **Export du résultat**
+   - **Par défaut, exporter systématiquement** — ne demander la confirmation à l'utilisateur que si son message évoque une liste sans mention d'export.
+   - Nom du fichier : `journal-demarches-<JJ-MM-AAAA>.md` avec la date **d'export** (jour J), p. ex. `journal-demarches-06-11-2026.md`.
+   - Dossier cible, par priorité :
+     1. Chemin/dossier explicitement demandé par l'utilisateur ;
+     2. Sinon le dossier de travail courant de la session (p. ex. `~/Documents/CV`).
+   - Si un fichier du même nom existe déjà : c'est une **mise à jour volontaire** (nouveau jour = nouvelle date donc pas d'écrasement) ; si même jour, remplacer le contenu par la version fraîche et le signaler.
+   - Structure du fichier :
+     - Titre `# Journal des démarches — France Travail`
+     - Bloc citation : date d'export, source (URL du journal), total de démarches, nombre de dates, intervalle (du plus récent au plus ancien), légende des statuts (✔ « Faite » · ⚠ statut absent).
+     - Une section `## <date>` par groupe, entrées en `- ✔ Titre` ou `- ⚠ Titre`.
+     - Section finale `## Statistiques rapides` recomptées sur le lot réel :
+       - Réponses à des offres d'emploi (entrées commençant par « Réponse à l'offre ») ;
+       - Recherches d'offres/entreprises (entrées commençant par « Recherche offres ») ventilées par site détecté (Indeed / Linkedin / sans site précisé) ;
+       - Autres démarches, et total, en vérifiant que les trois sous-totaux = `total`.
+   - Écrire le fichier avec l'outil fichier (write), jamais via le navigateur. Signaler le chemin complet exact de l'export dans la réponse.
+
+## Contrat de succès
+
+- Plus aucun bouton « Afficher plus » sur la page (journal 100 % chargé).
+- Liste restituée groupée par date, `total` cohérent avec la plus ancienne date (création du compte).
+- Fichier d'export Markdown créé/mis à jour au chemin annoncé.
+- Aucun onglet BrowserOS existant n'a été fermé ; aucun état modifié (lecture seule côté navigateur).
+
+## Pièges
+
+| Problème | Solution |
+|----------|----------|
+| Ref du bouton change pendant la boucle | Re-retrouver le ref par `grep "Afficher plus"` à chaque clic |
+| Boucle infinie fausse | Arrêter au grep vide ; « Afficher les 15 jours précédents/suivants » ≠ « Afficher plus » |
+| `snapshot`/`read` tronqués (47 pages) | Extraire via `evaluate` + `maxChars: 200000`, jamais via snapshot/read |
+| Entrées h3 hors timeline (« Intensité de recherche ») | Ignorer les h2 `^\d+ \w+ 2026$` (en-têtes mois de la section graphique) |
+| Statut absent sur certaines entrées | Les lister avec ⚠ (possible démarche planée « à faire » ou artefact) |
+| Détails d'une démarche spécifique | Cliquer son bouton dans la timeline puis utiliser `read` (markdown) pour les valeurs |
+| Export : statistiques qui ne tombent pas juste | Recompter les sous-totaux en fin de génération et garantir leur somme = `total` avant d'écrire |
+| Export : écrasement involontaire d'un export récent | Le nom comporte la date d'export ; vérifier le dossier cible avant d'écrire et signaler tout remplacement |
+| Page non connectée | Demander à l'utilisateur de se connecter dans BrowserOS puis reprendre à l'étape 2 |
+---
+name: france-travail-recherche
+description: "Use when the user asks to add a démarche to their France Travail 'Journal des démarches' (Organisation des démarches) on candidat.francetravail.fr, of type 'repondre' (répondre à une offre d'emploi / candidature : entreprise + métier + commentaire + date) or type 'rechercher' (recherche d'offres sur un site internet : site + métier + commentaire + date)."
+allowed-tools: ["Inspect", "WebSearch", "Bash", "browseros_tabs", "browseros_snapshot", "browseros_act", "browseros_navigate", "browseros_diff", "browseros_wait", "browseros_read"]
+---
+
+# Ajouter une démarche (repondre | rechercher)
+
+## Overview
+
+Enregistre une démarche dans le journal des démarches de France Travail
+(`/demarcheretouremploi/journal/ajouter`) via le MCP BrowserOS. Le 1er
+paramètre choisit le **type** de démarche :
+
+- `repondre` — « Répondre à des offres d'emploi » (comportement historique)
+- `rechercher` — « Rechercher des offres d'emploi ou d'entreprises »
+  via la variante **« Sur internet »** (canal Internet)
+
+## Entrées
+
+- `$1` — **type de démarche** (obligatoire) : `repondre` ou `rechercher`.
+  Défaut si absent/ambigu : `repondre` (rétrocompatibilité).
+- `$2` — `repondre` : nom de l'entreprise · `rechercher` : nom du site ou applicatif (ex. Indeed)
+- `$3` — nom du métier (obligatoire pour les deux types)
+- `$4` — commentaire (optionnel, texte libre)
+- `$5` — date au format JJ/MM/AAAA (optionnel, défaut : date du jour)
+- Nom de l'entreprise pour `rechercher` si fourni par l'utilisateur, sinon `"Non précisé"` (champ requis par le site).
+
+## Étapes
+
+1. **Préparer BrowserOS**
+   - Vérifier qu'il tourne : `ps -C browseros`. Sinon le lancer en arrière-plan (`/usr/bin/browseros &`) et attendre son démarrage.
+   - `tabs` avec `action: "list"`. Ne **jamais** fermer un onglet existant.
+   - Si aucun onglet n'est déjà sur l'URL cible, ouvrir `tabs` `action: "new"`, `url: "https://candidat.francetravail.fr/demarcheretouremploi/journal/ajouter"`, `background: false`. Sinon l'utiliser directement (session courante).
+
+2. **Ouvrir / réactiver la page d'ajout**
+   - `navigate` (`action: "url"`) vers `https://candidat.francetravail.fr/demarcheretouremploi/journal/ajouter` si l'onglet n'est pas déjà sur cette URL.
+   - `wait` (`for: "selector"`, `value: "h1"`) ou attendre la fin du chargement.
+   - Si une popup cookie ou une bannière apparaît, la fermer puis continuer.
+   - Contrat : la page affiche `h1 "Mon outil d'organisation des démarches : ajouter une démarche"`.
+   - ⚠ La page demande une connexion (menu `button "Misel Brzulovic"` visible = connecté). Si connexion requise, demander à l'utilisateur dans BrowserOS puis reprendre ici.
+
+3. **Déplier la catégorie "Préparer sa candidature"**
+   - Les deux démarches cibles se trouvent dans la catégorie **"Préparer sa candidature"** (pas de section "Mes candidatures" ; autres catégories : "Trouver un emploi", "Se former", "Choisir un métier", "Ma création et reprise d'entreprise", "Mes contraintes personnelles").
+   - `grep` `pattern: "Parcourir les démarches du type Préparer sa candidature"` → bouton `[collapsed]` ref.
+   - `act` `kind: "click"` sur ce ref → passe à `[expanded]` (contrat).
+   - Les sous-éléments sont chargés paresseusement à l'expansion : resnapshotter après le clic.
+
+4. **Branche selon `$1`** — cliquer sur l'entrée du type choisi :
+
+   ### 4a. `$1 = repondre` → « Répondre à des offres d'emploi »
+   - `grep` `pattern: "Répondre à des offres d'emploi"` → bouton direct du 2e niveau (ref, ex. `e84`).
+   - `act` `kind: "click"` → un `dialog "Répondre à des offres d'emploi"` doit apparaître (contrat).
+   - Champs du dialogue : date (préremplie au jour J), **Nom de l'entreprise** → `$2`, **Nom du métier** → `$3`, Commentaire → `$4`.
+   - Une case **"Démarche réalisée"** apparaît dès qu'une date passée est saisie : la cocher si la démarche est déjà réalisée (cas d'une date passée).
+
+   ### 4b. `$1 = rechercher` → variante « Sur internet »
+   - `grep` `pattern: "Voir les démarches de Rechercher des offres d'emploi ou d'entreprises"` → bouton du 2e niveau.
+   - `act` `kind: "click"` sur ce ref : il passe `[expanded]` et dévoile un **3e niveau** de variantes (contrat) :
+     - "En participant à un atelier, une prestation, une réunion d'information", "Avec l'aide d'une personne ou d'une structure", **"Sur internet"**, "Avec une agence d'intérim", "Avec un cabinet de recrutement", "Par un autre moyen", "Moyen à définir".
+   - `act` `kind: "click"` sur `Voir le détail de la démarche Sur internet` → un `dialog "Rechercher des offres d'emploi ou d'entreprises sur internet"` doit apparaître (contrat).
+
+5. **Remplir le formulaire du dialogue**
+   - `snapshot` pour récupérer les refs du dialogue. Champs (type `rechercher` / « sur internet ») :
+     - Combobox `"* Sélectionnez une date, échéance, ou période …"` → laisser sur `"Date"` (défaut).
+     - Textbox `"* Date de réalisation de la démarche (Format: JJ/MM/AAAA)"` → `$5` ou date du jour (préremplie ; ne l'écraser que si `$5` fourni).
+     - Textbox `"* Nom du site ou applicatif"` → `$2` (ex. "Indeed") — requis.
+     - Textbox `"* Nom du métier"` → `$3` — requis.
+     - Textbox `"* Nom de l'entreprise"` → valeur fournie par l'utilisateur, sinon `"Non précisé"` — requis.
+     - Textbox `"Commentaire"` → `$4`.
+     - Case **"Démarche réalisée"** (apparaît après saisie d'une date passée) → cocher si réalisée ; sinon la laisser décochée (démarche planifiée). ⚠ Après un `click` sur la case, le `diff` peut ne rien montrer : refaire un `snapshot` pour vérifier l'état.
+   - Remplir avec `act` `kind: "fill"` + `ref` + `value`. Commentaire long rejeté par `fill` → `click` sur le champ puis `kind: "type"`.
+   - `diff` pour vérifier que tous les champs sont renseignés.
+
+6. **Valider et fermer**
+   - `act` `kind: "click"` sur `"Ajouter aux démarches"`.
+   - Pendant l'envoi, les boutons passent `[disabled]` (normal) ; attendre la fin.
+   - Contrat de succès : la page affiche `paragraph → link "Votre démarche a été ajoutée."` et un item `listitem "Démarche ajoutée : <type>"`. Le dialogue se ferme automatiquement (retour à la liste).
+   - Si un message d'alerte s'affiche au lieu de la confirmation : le lire (`snapshot`/`read`), corriger les champs signalés, re-cliquer.
+   - Vérification optionnelle : `navigate` vers `/demarcheretouremploi/journal`, `grep` sur le libellé ; le détail s'ouvre par `click` sur l'entrée du journal (termes/définitions parfois vides dans l'arbre d'accessibilité → utiliser `read`).
+   - Ne pas fermer l'onglet / la session du navigateur.
+
+## Contrat de succès
+
+- Confirmation `"Votre démarche a été ajoutée."` affichée + item `"Démarche ajoutée : …"` dans la liste.
+- Vérification journal : l'entrée apparaît à la date voulue (ex. `rechercher` → "Recherche offres ou entreprises sur Indeed : Devops Engineer") et son détail affiche `Démarche Faite` si cochée.
+- Aucun onglet BrowserOS existant n'a été fermé.
+
+## Pièges
+
+| Problème | Solution |
+|----------|----------|
+| `$1` absent ou ambigu | Traiter comme `repondre` et le signaler à l'utilisateur |
+| Section "Mes candidatures" introuvable | Structure réelle : déplier la catégorie "Préparer sa candidature" (étape 3) |
+| Sous-listes vides après expansion | Chargement paresseux : resnapshotter après chaque clic d'expansion |
+| Ref invalide après navigation | Resnapshotter la page, les refs ne survivent pas à la navigation |
+| Nom de l'entreprise requis pour `rechercher` | Utiliser la valeur fournie, sinon "Non précisé" |
+| Date non voulue | Le champ date est prérempli au jour J ; ne le toucher que si `$5` est fourni |
+| Checkbox "Démarche réalisée" | Cochée = démarche faite (statut "Faite" dans le journal) ; pour une date passée, la cocher |
+| Checkbox cliquée mais `diff` vide | Resnapshotter pour confirmer l'état réel |
+| Commentaire long rejeté par `fill` | Utiliser `click` + `type` sur le champ |
+| Détail du journal illisible (definitions vides) | Utiliser `read` (markdown) au lieu de `snapshot` |
+| Boutons disabled après clic sur "Ajouter" | Attendre la confirmation, ne pas re-cliquer |
+| Page de connexion | Demander à l'utilisateur de se connecter dans BrowserOS puis reprendre à l'étape 2 |
+---
+name: pipeline-croise
+description: "Use when the user asks to cross-check his France Travail journal against his Indeed+LinkedIn sent applications — e.g. 'pipeline croisé', 'quelles candidatures à mettre à jour dans FT', 'croise FT et Indeed', 'candidatures non déclarées'. Runs (or reuses) the candidatures-envoyees and france-travail-liste exports, fuzzy-matches each sent application (company) against 'Réponse à l'offre de X' journal entries, and exports a pipeline Markdown listing applications MISSING from the FT journal (to declare via skill france-travail-recherche type=repondre) plus date mismatches to verify. Gmail export optional (exact dates for LinkedIn relative dates)."
+allowed-tools: ["Read", "Glob", "Write", "Edit", "Bash"]
+---
+
+# Pipeline croisé FT ⇄ Indeed ⇄ LinkedIn (→ démarches FT à jour)
+
+## Overview
+
+Croise **d'un côté** la liste des candidatures envoyées (Indeed + LinkedIn)
+et **de l'autre** le journal des démarches France Travail, pour identifier :
+
+1. ✅ les candidatures **déjà déclarées** dans FT (entreprise trouvée, date cohérente) ;
+2. ❌ les candidatures **absentes du journal FT** → à déclarer via le skill
+   `france-travail-recherche` avec `type = repondre` ;
+3. ⚠️ les **écarts de date** ou les 2ᵉ envois vers une même entreprise → à vérifier.
+
+Ce skill ne touche PAS aux sites : il ne fait que lire des fichiers d'export
+Markdown déjà générés (par `candidatures-envoyees` et `france-travail-liste`).
+Zéro navigation, zéro écriture dans FT à ce stade — la mise à jour réelle du
+journal se fait ensuite à la main via `france-travail-recherche repondre`.
+
+## Entrées
+
+- `$1` (optionnel) — dossier des exports. Défaut : `/home/misel/Documents/CV`.
+- `--fresh` (optionnel) — re-générer d'abord les sources (lancer les skills
+  `candidatures-envoyees` puis `france-travail-liste`) au lieu de réutiliser
+  les fichiers datés du jour.
+- `--no-export` — restitution écran seulement.
+
+## Fichiers sources (ordre de préférence)
+
+1. `candidatures-<JJ-MM-AAAA>.md` (export le plus récent du pattern) — Indeed + LinkedIn.
+2. `journal-demarches-<AAAA-MM-JJ>.md` (export le plus récent du pattern) — FT.
+3. `candidatures-gmail-<AAAA-MM-JJ>.md` (optionnel) — sert UNIQUEMENT à
+   corroborer les dates (LinkedIn n'expose que des dates relatives « 3w ago »
+   ; les mails « application was sent to… » donnent la date exacte).
+
+Si un fichier daté du jour n'existe pas → le générer via le skill
+correspondant AVANT de croiser (sauf si tout est déjà daté du jour).
+
+## Étapes
+
+1. **Charger les fichiers** (Read), repérer leur date d'export. Si dates d'export
+   dissonantes, le signaler (le croisement reste valable, les candidatures
+   postérieures à l'export FT manqueront — le signaler explicitement).
+
+2. **Extraire les deux listes** :
+   - Candidatures envoyées : lignes de table → `(source=Indeed|LinkedIn, titre, entreprise, lieu, date_envoi, statut)`.
+     - Dates LinkedIn relatives (« 3w ago ») : les remplacer, si dispo, par la
+       date exacte trouvée dans l'export Gmail (« Mišel, your application was
+       sent to <entreprise> », « Your application to <titre> at <entreprise> »).
+     - Normaliser le nom d'entreprise : minuscules, sans accents, sans suffixes
+       (SA, SAS, GROUP/GROUPE, UNITED, « Fil rouge », parenthèses …).
+   - Démarches FT : ne garder que les lignes `Réponse à l'offre de|de <entreprise>`
+     (les « Recherche offres… » ne comptent PAS comme candidature) →
+     `(entreprise_ft, date_ft)`.
+
+3. **Apparier (flux : candidature → démarche FT)**, matching par entreprise :
+   - Correspondance qualifies si nom normalisé identique OU l'un contient
+     l'autre (ex. « FDJ UNITED » ↔ « FDJ », « Dentsu for RATP » ↔ « RATP »,
+     « Sia » ↔ « SIA », « Seedfence » ↔ « SeedFence »).
+   - Cas de date : écart ≤ 7 j = OK ; écart > 7 j = ⚠️ à vérifier (pas auto).
+   - Une démarche FT peut couvrir plusieurs candidatures (2 envois même
+     entreprise) → le signaler, n'exiger qu'une démarche que si les envois ont
+     des dates d'écart > 7 j.
+   - Toute candidature sans appariement = ❌ **absente de FT**.
+
+4. **Dédupliquer la liste « absentes »** : même entreprise le même jour = une
+   seule démarche FT à créer ; même entreprise à des dates distinctes (> 7 j)
+   = autant de démarches.
+
+5. **Restituer** 3 blocs :
+   - ❌ **À déclarer dans FT** (tri du plus récent) : Date d'envoi exacte ·
+     Entreprise · Titre · Source (Indeed/LinkedIn) · Statut candidature et
+     métier suggéré pour la démarche (`Entreprise` + `Métier` = titre condensé,
+     ex. « Ingénieur DevOps »).
+   - ⚠️ **À vérifier** (écarts de date, doublons, 2ᵉ envois).
+   - ✅ **Déjà à jour** (table compacte candidature → démarche FT ; écart de
+     jours en colonne).
+
+6. **Exporter** (sauf `--no-export`) : `pipeline-croise-<JJ-MM-AAAA>.md` dans
+   `$1`. Structure : titre, bloc citation (fichiers sources + dates d'export +
+   total du jour ✓ 16 Indeed / ✘… ✓), puis les 3 blocs en tables, puis
+   « Statistiques rapides » (N candidatures / N couvertes / N manquantes /
+   N à vérifier) et rappel : « pour déclarer une manquante → skill
+   `france-travail-recherche` avec `repondre` (1ᵉʳ paramètre) ».
+
+## Contrat de Success
+
+- Deux fichiers sources **datés du jour** chargés (ou --fresh décidé avant).
+- Chaque candidature Indeed/LinkedIn a un des 3 verdicts (✅ / ❌ / ⚠️), aucune
+  omission silencieuse.
+- La liste ❌ porte une **date d'envoi exploitable** (Gmail si nécessaire pour
+  corriger les relatifs LinkedIn).
+- Fichier `pipeline-croise-<date>.md` créé (sauf `--no-export`).
+- Aucune écriture sur les sites — le skill ne lit que des fichiers locaux.
+
+## Pièges
+
+| Problème | Solution |
+|----------|----------|
+| Dates LinkedIn relatives (« 3w ago ») fausses de ±3 j | Corroborer via export Gmail (« application was sent to … ») — Gmail gagne |
+| « FDJ UNITED » vs « FDJ », « Dentsu for RATP / Fil rouge » vs « RATP », « Seedfence Paris/LaDefense », « Sia/SIA » | Normalisation + containment des deux sens |
+| 2 envois même entreprise (ex. SEVEN MILE ×2 même jour) | 1 seule démarche FT nécessaire ; le dire |
+| Journal FT : ne pas confondre « Réponse à l'offre de X » et « Recherche offres ou entreprises sur Indeed : Y » | Seules les lignes « Réponse à l'offre de » prouvent une candidature déclarée |
+| Écart de date FT vs envoi (FT = date de déclaration, pas d'envoi) | Écart ≤ 7 j = OK ; > 7 j = ⚠️ à vérifier, ne jamais auto-décider |
+| Export FT antérieur à des envois récents | Les lister comme manquantes CONSCIENT du décalage d'export, le signaler |
+| Export candidatures Incomplet (pagination Gmail) | Rappel en tête d'export : exhaustivité limitée aux compteurs vérifiés (ex. « Indeed 16/16 ») |

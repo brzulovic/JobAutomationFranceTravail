@@ -1,0 +1,6 @@
+{
+  "name": "JobAutomation Toolkit",
+  "description": "Generate Playwright automation scripts and browser console JS snippets for Indeed, LinkedIn, Gmail, and France Travail job search pipelines.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

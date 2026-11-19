@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  job-automation-toolkit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: job-automation-toolkit
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
