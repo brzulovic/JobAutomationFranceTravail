@@ -2,139 +2,127 @@ import { AutomationId } from '../types';
 
 export function generatePlaywrightScript(id: AutomationId, params: Record<string, any>): string {
   return `/**
- * Playwright Automation: ${id}
- * Includes mandatory ensureLoggedIn() authentication function executed first.
+ * Playwright Automation (TypeScript): ${id}
+ * Target URL: ${id === 'candidatures-envoyees' ? 'https://myjobs.indeed.com/applied' : id === 'candidatures-gmail' ? 'https://mail.google.com/mail/u/0/#starred' : 'https://candidat.francetravail.fr/demarcheretouremploi/journal'}
+ * Features INLINE PROCESSING for reusing already connected/logged-in browser sessions
  */
-import { chromium, Page } from 'playwright';
+import { chromium } from 'playwright';
 
-/**
- * 1. MANDATORY AUTHENTICATION / LOGIN STEP
- * Checks session cookies or prompts login if session is invalid/expired.
- */
-async function ensureLoggedIn(page: Page, targetUrl: string) {
-  console.log('[Auth] Checking authentication session for:', targetUrl);
-  await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(2000);
-
-  const currentUrl = page.url();
-  if (currentUrl.includes('login') || currentUrl.includes('signin') || currentUrl.includes('connexion')) {
-    console.log('[Auth] Session expired or not logged in. Please sign in in the browser window...');
-    // Wait for user manual login or auto-login cookies
-    await page.waitForURL((url) => !url.toString().includes('login') && !url.toString().includes('signin'), { timeout: 60000 });
-    console.log('[Auth] Successfully authenticated!');
-  } else {
-    console.log('[Auth] Active session verified successfully.');
-  }
-}
-
-async function runAutomation() {
-  const browser = await chromium.launch({ headless: false });
-  const context = await browser.newContext();
-  const page = await context.newPage();
-
+async function getConnectedPage() {
   try {
-    // STEP 1: Execute Login / Authentication Function first
-    await ensureLoggedIn(page, '${params.exportPath ? 'https://myjobs.indeed.com/applied' : 'https://candidat.francetravail.fr'}');
-
-    console.log('[Workflow] Executing core automation steps...');
-    // Core workflow execution here...
-    await page.waitForTimeout(3000);
-    console.log('[Workflow] Automation completed successfully.');
-
-  } finally {
-    await browser.close();
+    console.log('[Playwright] Connecting to existing browser via CDP (port 9222)...');
+    const browser = await chromium.connectOverCDP('http://localhost:9222');
+    const context = browser.contexts()[0] || await browser.newContext();
+    const page = context.pages()[0] || await context.newPage();
+    return { page, browser };
+  } catch (err) {
+    console.log('[Playwright] Launching persistent user context (reusing login session)...');
+    const context = await chromium.launchPersistentContext('./user_session_profile', {
+      headless: false,
+      viewport: { width: 1280, height: 800 }
+    });
+    return { page: context.pages()[0] || await context.newPage() };
   }
 }
 
-runAutomation().catch(console.error);
+async function run() {
+  const { page, browser } = await getConnectedPage();
+  try {
+    const targetUrl = '${id === 'candidatures-envoyees' ? 'https://myjobs.indeed.com/applied' : id === 'candidatures-gmail' ? 'https://mail.google.com/mail/u/0/#starred' : 'https://candidat.francetravail.fr/demarcheretouremploi/journal'}';
+    console.log('[Workflow] Navigating to:', targetUrl);
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(3000);
+    console.log('[Workflow] Successfully executed ${id} automation!');
+  } finally {
+    if (browser) await browser.close();
+  }
+}
+
+run().catch(console.error);
 `;
 }
 
 export function generateConsoleSnippet(id: AutomationId, params: Record<string, any>): string {
   return `/**
  * Browser Console JS Snippet: ${id}
- * Includes login session validation check.
+ * Aligned with TypeScript workflow logic for active session extraction.
  */
 (function() {
-  function ensureLoggedIn() {
+  console.log("=== JobAutomation Toolkit: ${id} ===");
+  
+  function ensureActiveSession() {
     if (window.location.href.includes("login") || document.querySelector('input[type="password"]')) {
-      console.warn("[Auth] Please log in to your account before running this snippet.");
+      console.warn("[Auth] Please log in to your account on this tab first.");
       return false;
     }
-    console.log("[Auth] Active browser session verified.");
+    console.log("[Auth] Active session verified.");
     return true;
   }
 
-  if (!ensureLoggedIn()) return;
-  console.log("Running ${id} automation snippet...");
+  if (!ensureActiveSession()) return;
+
+  const targetUrl = "${id === 'candidatures-envoyees' ? 'https://myjobs.indeed.com/applied' : id === 'candidatures-gmail' ? 'https://mail.google.com/mail/u/0/#starred' : 'https://candidat.francetravail.fr/demarcheretouremploi/journal'}";
+  console.log("Executing extraction for:", targetUrl);
+  
+  alert("Automation executed successfully on active session!");
 })();
 `;
 }
 
 export function generateCurlSnippet(id: AutomationId, params: Record<string, any>): string {
   return `# cURL Automation Script: ${id}
-# STEP 1: Authentication / Login Check (using session cookies)
-# Set your active session cookie below before executing
+# Aligned with TypeScript target endpoints and session cookie reuse
 
-SESSION_COOKIE="YOUR_ACTIVE_SESSION_COOKIE_HERE"
+SESSION_COOKIE="YOUR_REUSED_BROWSER_SESSION_COOKIE"
+TARGET_URL="${id === 'candidatures-envoyees' ? 'https://myjobs.indeed.com/applied' : id === 'candidatures-gmail' ? 'https://mail.google.com/mail/u/0/#starred' : 'https://candidat.francetravail.fr/demarcheretouremploi/journal'}"
 
-echo "[Auth] Verifying session cookie..."
-curl -s -I -H "Cookie: session_id=$SESSION_COOKIE" "https://myjobs.indeed.com/applied" | grep -E "HTTP/|Set-Cookie"
-
-echo "[Workflow] Executing cURL request with authenticated session..."
-curl -s -X GET "https://myjobs.indeed.com/applied" \\
-  -H "User-Agent: Mozilla/5.0" \\
+echo "[Auth] Verifying session for: $TARGET_URL"
+curl -s -X GET "$TARGET_URL" \\
+  -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \\
   -H "Cookie: session_id=$SESSION_COOKIE"
 `;
 }
 
 export function generatePythonSnippet(id: AutomationId, params: Record<string, any>): string {
   return `"""
-Python Requests Automation: ${id}
-Includes mandatory ensure_logged_in() authentication step.
+Python Playwright Automation (Aligned with TypeScript workflow): ${id}
+Reuses persistent user context or active browser session.
 """
-import requests
+from playwright.sync_api import sync_playwright
 
-def ensure_logged_in(session: requests.Session, test_url: str) -> bool:
-    print(f"[Auth] Checking authentication for {test_url}...")
-    resp = session.get(test_url, allow_redirects=True)
-    if "login" in resp.url or "connexion" in resp.url:
-        print("[Auth] Error: Session cookie invalid or expired. Please update credentials.")
-        return False
-    print("[Auth] Active session verified successfully.")
-    return True
-
-def run_automation():
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0"})
+def run_python_automation():
+    target_url = "${id === 'candidatures-envoyees' ? 'https://myjobs.indeed.com/applied' : id === 'candidatures-gmail' ? 'https://mail.google.com/mail/u/0/#starred' : 'https://candidat.francetravail.fr/demarcheretouremploi/journal'}"
     
-    # Inject session cookie
-    session.cookies.set("session_id", "YOUR_SESSION_COOKIE_HERE")
-
-    target_url = "https://myjobs.indeed.com/applied"
-    
-    # STEP 1: Login / Authentication check
-    if not ensure_logged_in(session, target_url):
-        return
-
-    print("[Workflow] Executing core python request...")
-    resp = session.get(target_url)
-    print(f"[Workflow] Response status: {resp.status_code}")
+    with sync_playwright() as p:
+        print("[Playwright] Launching persistent browser context...")
+        browser = p.chromium.launch_persistent_context(
+            user_data_dir="./user_session_profile",
+            headless=False,
+            viewport={"width": 1280, "height": 800}
+        )
+        page = browser.pages[0] if browser.pages else browser.new_page()
+        
+        print(f"[Workflow] Navigating to: {target_url}")
+        page.goto(target_url, wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+        
+        print("[Workflow] Python automation executed successfully!")
+        browser.close()
 
 if __name__ == "__main__":
-    run_automation()
+    run_python_automation()
 `;
 }
 
 export function generatePromptSnippet(id: AutomationId, params: Record<string, any>): string {
-  return `name: job-automation-${id}
-description: "AI Agent Prompt instruction file for executing ${id} automation."
-allowed-tools: ["Inspect", "Bash", "browseros_tabs", "browseros_navigate", "browseros_act", "browseros_evaluate"]
-
-# LLM Agent Instructions & Authentication Step
-1. **STEP 1 (Authentication)**: Execute ensureLoggedIn() to verify active session cookies or prompt user login if redirected to a login wall.
-2. Navigate to target URL after successful authentication.
-3. Extract structured object array or perform workflow action.
-4. Export results to requested destination.
-`;
+  return (
+    'name: job-automation-' + id + '\n' +
+    'description: "AI Agent Prompt instruction file aligned with TypeScript workflow for ' + id + '."\n' +
+    'allowed-tools: ["Inspect", "Bash", "browseros_tabs", "browseros_navigate", "browseros_act", "browseros_evaluate"]\n\n' +
+    '# LLM Agent Instructions (Aligned Workflow)\n' +
+    '1. Authentication: Verify session via CDP or persistent context (ensureLoggedIn).\n' +
+    '2. Target Navigation: Navigate to target URL (' + (id === 'candidatures-envoyees' ? 'https://myjobs.indeed.com/applied' : 'https://candidat.francetravail.fr/demarcheretouremploi/journal') + ').\n' +
+    '3. Structured Extraction: Run DOM evaluation matching TypeScript modular functions.\n' +
+    '4. Export: Generate Markdown/CSV report.\n'
+  );
 }
